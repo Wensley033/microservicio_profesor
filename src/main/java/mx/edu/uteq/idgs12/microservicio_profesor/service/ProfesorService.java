@@ -6,16 +6,24 @@ import java.util.stream.Collectors;
 import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Transactional;
 
+import io.github.resilience4j.circuitbreaker.annotation.CircuitBreaker;
+import io.github.resilience4j.retry.annotation.Retry;
 import lombok.RequiredArgsConstructor;
+import lombok.extern.slf4j.Slf4j;
 import mx.edu.uteq.idgs12.microservicio_profesor.client.DivisionClient;
 import mx.edu.uteq.idgs12.microservicio_profesor.dto.DivisionDto;
 import mx.edu.uteq.idgs12.microservicio_profesor.dto.ProfesorDto;
 import mx.edu.uteq.idgs12.microservicio_profesor.dto.ProfesorViewDto;
 import mx.edu.uteq.idgs12.microservicio_profesor.entity.ProfesorEntity;
+import mx.edu.uteq.idgs12.microservicio_profesor.exception.DivisionNotFoundException;
+import mx.edu.uteq.idgs12.microservicio_profesor.exception.DivisionServiceException;
+import mx.edu.uteq.idgs12.microservicio_profesor.exception.DuplicateEmailException;
+import mx.edu.uteq.idgs12.microservicio_profesor.exception.ProfesorNotFoundException;
 import mx.edu.uteq.idgs12.microservicio_profesor.repository.ProfesorRepository;
 
 @Service
 @RequiredArgsConstructor
+@Slf4j
 public class ProfesorService {
 
     private final ProfesorRepository profesorRepository;
@@ -32,88 +40,106 @@ public class ProfesorService {
     @Transactional(readOnly = true)
     public ProfesorDto obtenerPorId(Long id) {
         ProfesorEntity profesor = profesorRepository.findById(id)
-                .orElseThrow(() -> new RuntimeException("Profesor no encontrado con id: " + id));
+                .orElseThrow(() -> new ProfesorNotFoundException(id));
         return convertirADto(profesor);
     }
 
     @Transactional(readOnly = true)
     public ProfesorViewDto obtenerProfesorConDivision(Long profesorId) {
         ProfesorEntity profesor = profesorRepository.findById(profesorId)
-                .orElseThrow(() -> new RuntimeException("Profesor no encontrado con id: " + profesorId));
-        
+                .orElseThrow(() -> new ProfesorNotFoundException(profesorId));
+
         DivisionDto division = null;
-        
-        // Obtener información de la división solo si el profesor tiene una asignada
+
         if (profesor.getDivisionId() != null) {
             try {
-                division = divisionClient.obtenerDivisionPorId(profesor.getDivisionId());
+                division = obtenerDivisionConResiliencia(profesor.getDivisionId());
+            } catch (DivisionServiceException e) {
+                log.warn("Servicio de división no disponible para profesor {}: {}",
+                        profesorId, e.getMessage());
             } catch (Exception e) {
-                // Si falla la llamada al microservicio, continuamos sin la división
-                System.err.println("Error al obtener división: " + e.getMessage());
+                log.error("Error inesperado al obtener división para profesor {}: {}",
+                        profesorId, e.getMessage());
             }
         }
-        
+
         return convertirAViewDto(profesor, division);
     }
 
     @Transactional
     public ProfesorDto crear(ProfesorDto profesorDto) {
-        // Validar que el correo no exista
         if (profesorRepository.existsByCorreo(profesorDto.getCorreo())) {
-            throw new RuntimeException("Ya existe un profesor con el correo: " + profesorDto.getCorreo());
+            throw new DuplicateEmailException(profesorDto.getCorreo());
         }
-        
-        // Validar que la división existe si se proporciona
+
         if (profesorDto.getDivisionId() != null) {
-            try {
-                divisionClient.obtenerDivisionPorId(profesorDto.getDivisionId());
-            } catch (Exception e) {
-                throw new RuntimeException("División no encontrada con id: " + profesorDto.getDivisionId());
-            }
+            validarDivisionExiste(profesorDto.getDivisionId());
         }
-        
+
         ProfesorEntity profesor = convertirAEntidad(profesorDto);
         ProfesorEntity guardado = profesorRepository.save(profesor);
+        log.info("Profesor creado exitosamente: {}", guardado.getId());
         return convertirADto(guardado);
     }
 
     @Transactional
     public ProfesorDto actualizar(Long id, ProfesorDto profesorDto) {
         ProfesorEntity profesor = profesorRepository.findById(id)
-                .orElseThrow(() -> new RuntimeException("Profesor no encontrado con id: " + id));
-        
-        // Validar correo si cambió
-        if (!profesor.getCorreo().equals(profesorDto.getCorreo()) && 
-            profesorRepository.existsByCorreo(profesorDto.getCorreo())) {
-            throw new RuntimeException("Ya existe un profesor con el correo: " + profesorDto.getCorreo());
+                .orElseThrow(() -> new ProfesorNotFoundException(id));
+
+        if (!profesor.getCorreo().equals(profesorDto.getCorreo()) &&
+                profesorRepository.existsByCorreo(profesorDto.getCorreo())) {
+            throw new DuplicateEmailException(profesorDto.getCorreo());
         }
-        
-        // Validar que la división existe si se proporciona o cambió
-        if (profesorDto.getDivisionId() != null && 
-            !profesorDto.getDivisionId().equals(profesor.getDivisionId())) {
-            try {
-                divisionClient.obtenerDivisionPorId(profesorDto.getDivisionId());
-            } catch (Exception e) {
-                throw new RuntimeException("División no encontrada con id: " + profesorDto.getDivisionId());
-            }
+
+        if (profesorDto.getDivisionId() != null &&
+                !profesorDto.getDivisionId().equals(profesor.getDivisionId())) {
+            validarDivisionExiste(profesorDto.getDivisionId());
         }
-        
+
         profesor.setNombre(profesorDto.getNombre());
         profesor.setApellido(profesorDto.getApellido());
         profesor.setCorreo(profesorDto.getCorreo());
         profesor.setTelefono(profesorDto.getTelefono());
         profesor.setDivisionId(profesorDto.getDivisionId());
-        
+
         ProfesorEntity actualizado = profesorRepository.save(profesor);
+        log.info("Profesor actualizado exitosamente: {}", actualizado.getId());
         return convertirADto(actualizado);
     }
 
     @Transactional
     public void eliminar(Long id) {
         if (!profesorRepository.existsById(id)) {
-            throw new RuntimeException("Profesor no encontrado con id: " + id);
+            throw new ProfesorNotFoundException(id);
         }
         profesorRepository.deleteById(id);
+        log.info("Profesor eliminado exitosamente: {}", id);
+    }
+
+    @CircuitBreaker(name = "divisionService", fallbackMethod = "obtenerDivisionFallback")
+    @Retry(name = "divisionService")
+    private DivisionDto obtenerDivisionConResiliencia(Long divisionId) {
+        log.debug("Intentando obtener división con id: {}", divisionId);
+        return divisionClient.obtenerDivisionPorId(divisionId);
+    }
+
+    private DivisionDto obtenerDivisionFallback(Long divisionId, Exception e) {
+        log.warn("Fallback activado para división {}: {}", divisionId, e.getMessage());
+        return null;
+    }
+
+    private void validarDivisionExiste(Long divisionId) {
+        try {
+            DivisionDto division = obtenerDivisionConResiliencia(divisionId);
+            if (division == null) {
+                throw new DivisionNotFoundException(divisionId);
+            }
+        } catch (DivisionServiceException e) {
+            throw e;
+        } catch (Exception e) {
+            throw new DivisionNotFoundException("No se pudo verificar la división con id: " + divisionId);
+        }
     }
 
     // Métodos de conversión

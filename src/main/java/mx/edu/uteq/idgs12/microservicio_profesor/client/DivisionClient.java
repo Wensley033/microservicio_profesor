@@ -8,9 +8,13 @@ import org.springframework.web.bind.annotation.PathVariable;
 
 import mx.edu.uteq.idgs12.microservicio_profesor.dto.DivisionDto;
 
-// Se cambió la ruta base de "/api/divisiones" a "/divisiones" 
+// Se cambió la ruta base de "/api/divisiones" a "/divisiones"
 // para coincidir con tu DivisionController
-@FeignClient(name = "microservicio-division", path = "/divisiones")
+@FeignClient(
+    name = "microservicio-division",
+    path = "/divisiones",
+    fallback = DivisionClientFallback.class
+)
 public interface DivisionClient {
 
     @GetMapping("/{id}")
